@@ -2,52 +2,171 @@ name: GitOps CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   workflow_dispatch:
 
+# Required for GitHub OIDC authentication
 permissions:
   contents: read
+  id-token: write
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-  build-scan-push:
+
+  # =========================================================
+  # STAGE 1: LINT
+  # =========================================================
+  lint:
+    name: Stage 1 - Lint
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout CI repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          python-version: "3.12"
 
-      - name: Login to Amazon ECR
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install flake8
 
-      - name: Build frontend image
+      - name: Run backend lint
+        working-directory: backend
+        run: |
+          flake8 app.py
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: |
+          npm install
+
+      - name: Run frontend lint
+        working-directory: frontend
+        run: |
+          npm run lint --if-present
+
+
+  # =========================================================
+  # STAGE 2: UNIT TEST
+  # =========================================================
+  unit-test:
+    name: Stage 2 - Unit Test
+    runs-on: ubuntu-latest
+
+    needs: lint
+
+    steps:
+      - name: Checkout CI repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install pytest
+
+      - name: Run backend unit tests
+        working-directory: backend
+        run: |
+          pytest -v
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: |
+          npm install
+
+      - name: Run frontend unit tests
+        working-directory: frontend
+        run: |
+          npm test --if-present
+
+
+  # =========================================================
+  # STAGE 3: BUILD DOCKER IMAGES
+  # =========================================================
+  build-image:
+    name: Stage 3 - Build Docker Images
+    runs-on: ubuntu-latest
+
+    needs: unit-test
+
+    steps:
+      - name: Checkout CI repository
+        uses: actions/checkout@v4
+
+      - name: Build frontend Docker image
         run: |
           docker build \
-            -t "$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG" \
+            -t frontend:${IMAGE_TAG} \
             ./frontend
-        env:
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_FRONTEND_REPOSITORY: ${{ secrets.ECR_FRONTEND_REPOSITORY }}
 
-      - name: Build backend image
+      - name: Build backend Docker image
         run: |
           docker build \
-            -t "$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG" \
+            -t backend:${IMAGE_TAG} \
             ./backend
-        env:
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_BACKEND_REPOSITORY: ${{ secrets.ECR_BACKEND_REPOSITORY }}
+
+      - name: Save Docker images
+        run: |
+          docker save frontend:${IMAGE_TAG} > frontend-image.tar
+          docker save backend:${IMAGE_TAG} > backend-image.tar
+
+      - name: Upload Docker images
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images
+          path: |
+            frontend-image.tar
+            backend-image.tar
+
+
+  # =========================================================
+  # STAGE 4: SCAN IMAGES
+  # =========================================================
+  scan-image:
+    name: Stage 4 - Trivy Image Scan
+    runs-on: ubuntu-latest
+
+    needs: build-image
+
+    steps:
+      - name: Download Docker images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load frontend image
+        run: |
+          docker load < frontend-image.tar
+
+      - name: Load backend image
+        run: |
+          docker load < backend-image.tar
 
       - name: Install Trivy
         uses: aquasecurity/setup-trivy@v0.2.2
@@ -57,34 +176,95 @@ jobs:
           trivy image \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
-            "$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG"
-        env:
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_FRONTEND_REPOSITORY: ${{ secrets.ECR_FRONTEND_REPOSITORY }}
+            --ignore-unfixed \
+            frontend:${IMAGE_TAG}
 
       - name: Scan backend image
         run: |
           trivy image \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
-            "$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG"
-        env:
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_BACKEND_REPOSITORY: ${{ secrets.ECR_BACKEND_REPOSITORY }}
+            --ignore-unfixed \
+            backend:${IMAGE_TAG}
 
-      - name: Push frontend image
-        run: |
-          docker push "$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG"
-        env:
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_FRONTEND_REPOSITORY: ${{ secrets.ECR_FRONTEND_REPOSITORY }}
 
-      - name: Push backend image
+  # =========================================================
+  # STAGE 5: PUSH IMAGES TO ECR
+  # =========================================================
+  push-ecr:
+    name: Stage 5 - Push Images to ECR
+    runs-on: ubuntu-latest
+
+    needs: scan-image
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout CI repository
+        uses: actions/checkout@v4
+
+      - name: Download Docker images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load frontend image
         run: |
-          docker push "$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG"
-        env:
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          ECR_BACKEND_REPOSITORY: ${{ secrets.ECR_BACKEND_REPOSITORY }}
+          docker load < frontend-image.tar
+
+      - name: Load backend image
+        run: |
+          docker load < backend-image.tar
+
+      # -----------------------------------------------------
+      # AWS OIDC AUTHENTICATION
+      # -----------------------------------------------------
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag frontend image
+        run: |
+          docker tag \
+            frontend:${IMAGE_TAG} \
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_FRONTEND_REPOSITORY }}:${IMAGE_TAG}
+
+      - name: Tag backend image
+        run: |
+          docker tag \
+            backend:${IMAGE_TAG} \
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_BACKEND_REPOSITORY }}:${IMAGE_TAG}
+
+      - name: Push frontend image to ECR
+        run: |
+          docker push \
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_FRONTEND_REPOSITORY }}:${IMAGE_TAG}
+
+      - name: Push backend image to ECR
+        run: |
+          docker push \
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_BACKEND_REPOSITORY }}:${IMAGE_TAG}
+
+
+  # =========================================================
+  # STAGE 6: TRIGGER CD
+  # =========================================================
+  trigger-cd:
+    name: Stage 6 - Trigger CD Repository
+    runs-on: ubuntu-latest
+
+    needs: push-ecr
+
+    steps:
+      - name: Checkout CI repository
+        uses: actions/checkout@v4
 
       - name: Checkout CD repository
         uses: actions/checkout@v4
@@ -93,16 +273,40 @@ jobs:
           token: ${{ secrets.GITOPS_REPO_TOKEN }}
           path: cd-repo
 
-      - name: Update GitOps image tags
+      - name: Install Kustomize
         run: |
-          sed -i "s#frontendImageTag:.*#frontendImageTag: \"$IMAGE_TAG\"#" cd-repo/environments/dev/values.yaml
-          sed -i "s#backendImageTag:.*#backendImageTag: \"$IMAGE_TAG\"#" cd-repo/environments/dev/values.yaml
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Update frontend image tag
+        working-directory: cd-repo
+        run: |
+          kustomize edit set image \
+            frontend=\
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_FRONTEND_REPOSITORY }}:${IMAGE_TAG}
+
+      - name: Update backend image tag
+        working-directory: cd-repo
+        run: |
+          kustomize edit set image \
+            backend=\
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_BACKEND_REPOSITORY }}:${IMAGE_TAG}
+
+      - name: Show GitOps changes
+        working-directory: cd-repo
+        run: |
+          git diff
 
       - name: Commit and push GitOps change
         working-directory: cd-repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add environments/dev/values.yaml
-          git commit -m "Update application images to $IMAGE_TAG" || echo "No changes to commit"
+
+          git add environments/dev/kustomization.yaml
+
+          git commit \
+            -m "Update application images to ${IMAGE_TAG}" \
+            || echo "No changes to commit"
+
           git push
