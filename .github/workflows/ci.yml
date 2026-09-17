@@ -1,0 +1,108 @@
+name: GitOps CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout CI repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build frontend image
+        run: |
+          docker build \
+            -t "$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG" \
+            ./frontend
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_FRONTEND_REPOSITORY: ${{ secrets.ECR_FRONTEND_REPOSITORY }}
+
+      - name: Build backend image
+        run: |
+          docker build \
+            -t "$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG" \
+            ./backend
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_BACKEND_REPOSITORY: ${{ secrets.ECR_BACKEND_REPOSITORY }}
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@v0.2.2
+
+      - name: Scan frontend image
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            "$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG"
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_FRONTEND_REPOSITORY: ${{ secrets.ECR_FRONTEND_REPOSITORY }}
+
+      - name: Scan backend image
+        run: |
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            "$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG"
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_BACKEND_REPOSITORY: ${{ secrets.ECR_BACKEND_REPOSITORY }}
+
+      - name: Push frontend image
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG"
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_FRONTEND_REPOSITORY: ${{ secrets.ECR_FRONTEND_REPOSITORY }}
+
+      - name: Push backend image
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG"
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_BACKEND_REPOSITORY: ${{ secrets.ECR_BACKEND_REPOSITORY }}
+
+      - name: Checkout CD repository
+        uses: actions/checkout@v4
+        with:
+          repository: YOUR_GITHUB_ORG/YOUR-CD-REPO
+          token: ${{ secrets.GITOPS_REPO_TOKEN }}
+          path: cd-repo
+
+      - name: Update GitOps image tags
+        run: |
+          sed -i "s#frontendImageTag:.*#frontendImageTag: \"$IMAGE_TAG\"#" cd-repo/environments/dev/values.yaml
+          sed -i "s#backendImageTag:.*#backendImageTag: \"$IMAGE_TAG\"#" cd-repo/environments/dev/values.yaml
+
+      - name: Commit and push GitOps change
+        working-directory: cd-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add environments/dev/values.yaml
+          git commit -m "Update application images to $IMAGE_TAG" || echo "No changes to commit"
+          git push
