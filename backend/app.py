@@ -1,4 +1,3 @@
-
 from flask import Flask, jsonify
 import os
 
@@ -28,3 +27,5 @@ def ready():
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
 
+
+**Important:** After the last line, do not add another blank line.
